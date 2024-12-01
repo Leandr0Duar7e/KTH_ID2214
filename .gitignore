@@ -1,2 +1,6 @@
 .DS_Store
 .vscode/settings.json
+
+# Ignore files inside data folder, but keep the folder structure
+Assignment4/Leandro_approach/data/**/*.csv
+Assignment4/Leandro_approach/data/**/*.parquet

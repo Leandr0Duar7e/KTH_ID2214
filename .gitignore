@@ -4,3 +4,6 @@
 # Ignore files inside data folder, but keep the folder structure
 Assignment4/Leandro_approach/data/**/*.csv
 Assignment4/Leandro_approach/data/**/*.parquet
+
+# Ignore big dataset
+Assignment4/Stefano_approach/**/all_features.csv

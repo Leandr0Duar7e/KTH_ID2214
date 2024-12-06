@@ -3,7 +3,7 @@ from typing import List, Literal, Tuple
 import numpy as np
 import pandas as pd
 from rdkit import Chem
-from rdkit.Chem import Fragments, Lipinski, rdFingerprintGenerator
+from rdkit.Chem import Fragments, Lipinski, rdFingerprintGenerator, Descriptors
 from rdkit.Chem.Descriptors import MolLogP, rdMolDescriptors
 from rdkit.Chem.rdchem import Mol
 from sklearn.base import BaseEstimator
@@ -21,6 +21,7 @@ from sklearn.preprocessing import MinMaxScaler
 
 
 def fr_fluoro(mol: Mol) -> int:
+    """Count carbon-fluorine bonds in molecule"""
     return sum(
         1
         for bond in mol.GetBonds()
@@ -30,6 +31,7 @@ def fr_fluoro(mol: Mol) -> int:
 
 
 def fr_chloro(mol: Mol) -> int:
+    """Count carbon-chlorine bonds in molecule"""
     return sum(
         1
         for bond in mol.GetBonds()
@@ -39,6 +41,7 @@ def fr_chloro(mol: Mol) -> int:
 
 
 def fr_arom_oxo(mol: Mol) -> int:
+    """Count aromatic carbon-oxygen double bonds"""
     return sum(
         1
         for bond in mol.GetBonds()
@@ -50,6 +53,7 @@ def fr_arom_oxo(mol: Mol) -> int:
 
 
 def fr_alcohol(mol: Mol) -> int:
+    """Count non-aromatic hydroxyl groups"""
     return sum(
         1
         for bond in mol.GetBonds()
@@ -61,6 +65,7 @@ def fr_alcohol(mol: Mol) -> int:
 
 
 def fr_alkene(mol: Mol) -> int:
+    """Count carbon-carbon double bonds"""
     return sum(
         1
         for bond in mol.GetBonds()
@@ -73,6 +78,16 @@ def fr_alkene(mol: Mol) -> int:
 def expand_structural_features(
     df: pd.DataFrame, radius: int = 3, vector_size: int = 1024
 ) -> pd.DataFrame:
+    """
+    Extracts structural features from molecules including:
+    - Functional group counts (amides, ethers, amines etc.)
+    - Extended Connectivity Fingerprints (ECFP)
+    - Basic molecular information (atom counts, bonds)
+    
+    Parameters:
+        radius: ECFP radius parameter
+        vector_size: Length of ECFP bit vector
+    """
     new_df = df.copy()
     mols = df["MOL"]
 
@@ -125,6 +140,13 @@ def expand_structural_features(
 
 
 def expand_physicochemical_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Calculates key physicochemical properties:
+    - Molecular weight
+    - Lipophilicity (LogP)
+    - H-bond donors/acceptors
+    - Rotatable bonds
+    """
     new_df = df.copy()
     mols = new_df["MOL"]
 
@@ -142,6 +164,11 @@ def expand_physicochemical_features(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def expand_electronic_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Computes electronic/structural properties:
+    - Topological polar surface area (TPSA)
+    - Number of aromatic rings
+    """
     new_df = df.copy()
     mols = new_df["MOL"]
 
@@ -172,6 +199,13 @@ def split_features_target(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
 
 
 class BasePreprocessing:
+    """
+    Base preprocessing pipeline that handles:
+    1. Feature expansion from SMILES
+    2. Removal of constant features
+    3. Feature scaling
+    4. Dimensionality reduction of ECFP via PCA
+    """
     def __init__(self):
         self.constant_remover: VarianceThreshold = None
         self.feature_scaler: MinMaxScaler = None
@@ -196,6 +230,12 @@ class BasePreprocessing:
         return new_df
 
     def __fit_ecfp_pca(self, df: pd.DataFrame) -> Tuple[List[str], PCA, pd.DataFrame]:
+        """
+        Reduces ECFP dimensionality using PCA:
+        1. Extracts ECFP columns
+        2. Applies PCA to reduce to 100 components
+        3. Scales PCA components to [0,1] range
+        """
         new_df = df.copy()
 
         self.ecfp_cols = [col for col in new_df.columns if col.startswith("ecfp")]
@@ -292,6 +332,15 @@ class BasePreprocessing:
 
 
 class StatisticalPreprocessing:
+    """
+    Extends BasePreprocessing with statistical feature selection using:
+    - K-best features
+    - False Positive Rate control
+    - False Discovery Rate control 
+    - Family-wise Error Rate control
+    
+    All based on mutual information with target variable
+    """
     def __init__(self) -> None:
         self.columns: List[str] = None
         self.base_transform: BasePreprocessing = BasePreprocessing()
@@ -331,6 +380,10 @@ class StatisticalPreprocessing:
 
 
 def compute_score(selector: BaseEstimator):
+    """
+    Extracts feature importance scores from a fitted model
+    Handles both linear models (coef_) and tree-based models (feature_importances_)
+    """
     try:
         importance = np.absolute(selector.estimator_.coef_).squeeze()
     except AttributeError:
@@ -340,6 +393,11 @@ def compute_score(selector: BaseEstimator):
 
 
 class FromModelPreprocessing:
+    """
+    Extends BasePreprocessing with model-based feature selection:
+    - Uses any sklearn-compatible model's feature importance
+    - Selects top N most important features
+    """
     def __init__(self) -> None:
         self.base_transform: BasePreprocessing = BasePreprocessing()
         self.columns: List[str] = None

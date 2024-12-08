@@ -1,14 +1,54 @@
+"""
+Quick Start Guide:
+-----------------
+1. Installation:
+   # Core dependencies
+   pip install rdkit pandas swifter scikit-learn imblearn
+   
+   # For molecular embeddings
+   pip install gensim
+   pip install git+https://github.com/samoturk/mol2vec
+
+2. Required Data Structure:
+   Parent Directory/
+   ├── training_smiles.csv  # Must have 'SMILES' and 'ACTIVE' columns
+   ├── test_smiles.csv      # Must have 'SMILES' column
+   └── models/              # Will be created automatically
+       └── model_300dim.pkl # Mol2vec model (auto-downloaded)
+
+3. Basic Usage:
+   python preprocessing.py
+   
+   This will:
+   - Download mol2vec model if needed
+   - Create 'processed_data' directory
+   - Generate:
+     - processed_train.parquet
+     - processed_test.parquet
+     - selected_columns.txt
+
+4. Output Structure:
+   processed_data/
+   ├── processed_train.parquet  # Processed training data
+   ├── processed_test.parquet   # Processed test data
+   └── selected_columns.txt     # Selected feature names
+
+Note: First run may take longer due to model download and feature computation
+"""
+
 import os
 import warnings
-import urllib.request
-import logging
-from functools import lru_cache
-
-# Suppress Intel MKL warnings
+warnings.filterwarnings('ignore')
 os.environ['MKL_DISABLE_FAST_MM'] = '1'
 
-# Suppress all warnings
-warnings.filterwarnings('ignore')
+import logging
+from functools import lru_cache
+from rdkit import RDLogger
+import time
+from sklearn.metrics import roc_auc_score
+
+# Suppress RDKit warnings
+RDLogger.DisableLog('rdApp.*')
 
 from typing import List, Literal, Tuple, Optional, Dict  
 from pathlib import Path
@@ -34,8 +74,15 @@ from sklearn.feature_selection import (
 )
 from sklearn.preprocessing import MinMaxScaler
 # pip install git+https://github.com/samoturk/mol2vec
-from mol2vec.features import mol2alt_sentence, mol2sentence, MolSentence, DfVec
+from mol2vec.features import mol2alt_sentence, mol2sentence, MolSentence, DfVec, sentences2vec
 from gensim.models import word2vec
+from imblearn.over_sampling import SMOTE
+from imblearn.combine import SMOTEENN
+from sklearn.model_selection import StratifiedKFold
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import cross_val_score
+from scipy import stats
+from statsmodels.stats.multitest import multipletests
 
 
 def fr_fluoro(mol: Mol) -> int:
@@ -97,14 +144,13 @@ def expand_structural_features(
     df: pd.DataFrame, radius: int = 3, vector_size: int = 1024
 ) -> pd.DataFrame:
     """
-    Extracts structural features from molecules including:
-    - Functional group counts (amides, ethers, amines etc.)
-    - Extended Connectivity Fingerprints (ECFP)
-    - Basic molecular information (atom counts, bonds)
+    Comprehensive molecular feature extraction pipeline that generates:
+    - Functional group counts (amides, ethers, etc.)
+    - Extended Connectivity Fingerprints (ECFP) for structural similarity
+    - Basic molecular descriptors (atom/bond counts)
     
-    Parameters:
-        radius: ECFP radius parameter
-        vector_size: Length of ECFP bit vector
+    The ECFP radius parameter controls the size of structural fragments considered
+    vector_size determines fingerprint length (higher = more detailed but slower)
     """
     new_df = df.copy()
     mols = df["MOL"]
@@ -223,64 +269,77 @@ def expand_electronic_features(df: pd.DataFrame) -> pd.DataFrame:
 
 def expand_mol2vec_features(df: pd.DataFrame, model_path: str = "models/model_300dim.pkl") -> pd.DataFrame:
     """
-    Computes Mol2vec embeddings for molecules
-    
-    Parameters:
-        df: DataFrame with MOL column
-        model_path: Path to pretrained Mol2vec model
-    
-    Returns:
-        DataFrame with added Mol2vec features
+    Generates molecular embeddings using Mol2Vec, which converts molecules into vector representations:
+    - Uses pre-trained word2vec model on molecular substructures
+    - Each molecule gets a 300-dimensional embedding vector
+    - Handles missing substructures by averaging available vectors
+    - Useful for capturing complex molecular similarities
     """
-    new_df = df.copy()
-    mols = new_df["MOL"]
+    t_start = time.time()
     
-    # Load pretrained model
+    # Load pre-trained mol2vec model
+    logging.info("Loading mol2vec model...")
     model = word2vec.Word2Vec.load(model_path)
     
-    # Convert molecules to sentences and then to vectors
+    # Construct molecular sentences
+    logging.info(f"Processing {len(df)} molecules for mol2vec...")
+    sentences = [MolSentence(mol2alt_sentence(mol, 1)) for mol in df['MOL']]
+    
+    # Generate embeddings (adapted for gensim 4.x)
+    logging.info("Generating embeddings...")
+    keys = set(model.wv.index_to_key)
     vectors = []
-    for mol in mols:
-        # Get sentence
-        sentence = mol2alt_sentence(mol, 1)
-        # Convert sentence to numpy array before creating DfVec
-        sentence = np.array(sentence)
-        # Get vector
-        try:
-            vec = DfVec(sentence).vec(model)
-            vectors.append(vec)
-        except:
-            # If there's an error, append zeros
-            vectors.append(np.zeros(300))
+    for i, sentence in enumerate(sentences):
+        if i % 10000 == 0 and i > 0:
+            logging.info(f"Processed {i}/{len(sentences)} molecules...")
+        sent_vec = np.zeros(model.vector_size)
+        count = 0
+        for word in sentence:
+            if word in keys:
+                sent_vec += model.wv[word]
+                count += 1
+        if count > 0:
+            sent_vec /= count
+        vectors.append(sent_vec)
     
-    # Convert to numpy array
-    vectors = np.array(vectors)
+    # Create feature matrix
+    logging.info("Creating feature matrix...")
+    mol2vec_columns = [f"mol2vec_{i}" for i in range(model.vector_size)]
+    mol2vec_df = pd.DataFrame(vectors, columns=mol2vec_columns, index=df.index)
     
-    # Create feature columns
-    mol2vec_features = pd.DataFrame(
-        vectors,
-        columns=[f"mol2vec_{i}" for i in range(300)],
-        index=new_df.index
-    )
+    elapsed = time.time() - t_start
+    logging.info(f"Mol2vec processing completed in {elapsed:.2f} seconds")
     
-    return pd.concat([new_df, mol2vec_features], axis=1)
+    return pd.concat([df, mol2vec_df], axis=1)
 
 
 def expand_dataset(df: pd.DataFrame) -> pd.DataFrame:
+    logging.info("Starting feature expansion...")
     new_df = df.copy()
     
-    # Try using swifter if available, fallback to regular apply if not
+    # Convert SMILES to MOL objects
+    logging.info("Converting SMILES to MOL objects...")
     try:
         new_df["MOL"] = new_df["SMILES"].swifter.apply(Chem.MolFromSmiles)
     except ImportError:
         new_df["MOL"] = new_df["SMILES"].apply(Chem.MolFromSmiles)
     
     new_df = new_df.drop(columns=["SMILES"])
+    
+    logging.info("Generating structural features...")
     new_df = expand_structural_features(new_df)
+    
+    logging.info("Generating physicochemical features...")
     new_df = expand_physicochemical_features(new_df)
+    
+    logging.info("Generating electronic features...")
     new_df = expand_electronic_features(new_df)
+    
+    logging.info("Generating mol2vec features...")
     new_df = expand_mol2vec_features(new_df)
+    
     new_df = new_df.drop(columns=["MOL"])
+    logging.info("Feature expansion complete.")
 
     return new_df
 
@@ -291,11 +350,13 @@ def split_features_target(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series]:
 
 class BasePreprocessing:
     """
-    Base preprocessing pipeline that handles:
-    1. Feature expansion from SMILES
-    2. Removal of constant features
-    3. Feature scaling
-    4. Dimensionality reduction of ECFP via PCA
+    Core preprocessing pipeline implementing:
+    1. Feature expansion from SMILES strings to molecular descriptors
+    2. Removal of constant/non-informative features
+    3. Feature scaling to [0,1] range
+    4. Dimensionality reduction of ECFP fingerprints via PCA
+    
+    This serves as foundation for more advanced preprocessing strategies
     """
     def __init__(self):
         self.constant_remover: VarianceThreshold = None
@@ -305,27 +366,45 @@ class BasePreprocessing:
         self.pca_scaler: MinMaxScaler = None
 
     def fit_transform(self, df: pd.DataFrame, expand: bool = False) -> pd.DataFrame:
+        """Base preprocessing pipeline"""
+        t_start = time.time()
+        logging.info("Starting fit_transform...")
+        
         if expand:
+            logging.info("Expanding dataset features...")
             new_df = expand_dataset(df)
+            logging.info(f"Dataset expanded: {new_df.shape}")
         else:
             new_df = df.copy()
-
+        
+        logging.info("Fitting constant remover...")
         new_df = self.__fit_constant_remover(new_df)
-
+        logging.info(f"After constant removal: {new_df.shape}")
+        
+        logging.info("Removing duplicates...")
         new_df = new_df.drop_duplicates(keep="first")
-
+        logging.info(f"After duplicate removal: {new_df.shape}")
+        
+        logging.info("Fitting data scaler...")
         new_df = self.__fit_data_scaler(new_df)
-
+        logging.info(f"After scaling: {new_df.shape}")
+        
+        logging.info("Fitting ECFP PCA...")
         new_df = self.__fit_ecfp_pca(new_df)
-
+        logging.info(f"After ECFP PCA: {new_df.shape}")
+        
+        elapsed = time.time() - t_start
+        logging.info(f"fit_transform completed in {elapsed:.2f} seconds")
         return new_df
 
     def __fit_ecfp_pca(self, df: pd.DataFrame) -> Tuple[List[str], PCA, pd.DataFrame]:
         """
-        Reduces ECFP dimensionality using PCA:
-        1. Extracts ECFP columns
-        2. Applies PCA to reduce to 100 components
-        3. Scales PCA components to [0,1] range
+        Reduces high-dimensional ECFP fingerprints:
+        1. Identifies ECFP columns in dataset
+        2. Applies PCA to reduce to 100 most important components
+        3. Scales PCA components to [0,1] for consistency
+        
+        Returns modified dataframe with original ECFP columns replaced by PCA components
         """
         new_df = df.copy()
 
@@ -415,59 +494,140 @@ class BasePreprocessing:
     def __apply_constant_remover(self, feature_df: pd.DataFrame) -> pd.DataFrame:
         new_df = feature_df.copy()
 
-        new_df: pd.DataFrame = new_df[
-            list(self.constant_remover.get_feature_names_out())
-        ]
-
+        try:
+            # Get feature names directly from support mask if get_feature_names_out fails
+            try:
+                selected_features = list(self.constant_remover.get_feature_names_out())
+            except (AttributeError, TypeError):
+                feature_mask = self.constant_remover.get_support()
+                selected_features = feature_df.columns[feature_mask].tolist()
+            
+            new_df = new_df[selected_features]
+            
+        except Exception as e:
+            logging.error(f"Error in constant remover: {e}")
+            # Fallback: return all features if constant remover fails
+            new_df = feature_df.copy()
+        
         return new_df
 
 
 class StatisticalPreprocessing:
     """
-    Extends BasePreprocessing with statistical feature selection using:
-    - K-best features
-    - False Positive Rate control
-    - False Discovery Rate control 
-    - Family-wise Error Rate control
+    Advanced feature selection pipeline using multiple statistical approaches:
+    - K-best features based on mutual information
+    - False Positive Rate (FPR) control
+    - False Discovery Rate (FDR) control
+    - Family-wise Error Rate (FWER) control
+    - Model-based selection using Random Forest importance
     
-    All based on mutual information with target variable
+    Automatically evaluates and selects best performing method via cross-validation
     """
-    def __init__(self) -> None:
-        self.columns: Dict[str, List[str]] = {}  # Store columns for each mode
+    def __init__(self, transformed_df: Optional[pd.DataFrame] = None) -> None:
+        self.columns: Dict[str, List[str]] = {}
         self.base_transform: BasePreprocessing = BasePreprocessing()
-        self.transformed_df: Optional[pd.DataFrame] = None  # Cache transformed data
+        self.transformed_df = transformed_df
 
     def fit_transform_all_modes(
         self,
         df: pd.DataFrame,
-        max_features: int = 10,
+        max_features: int = 300,
         expand: bool = False,
+        sample_size: int = 50000
     ) -> Dict[str, pd.DataFrame]:
         """
-        Fit and transform data for all modes at once, reusing feature generation
+        Comprehensive feature selection process:
+        1. Samples data for computational efficiency
+        2. Applies multiple selection methods
+        3. Evaluates each method using Random Forest + cross-validation
+        4. Tracks best performing method
+        
+        Returns dictionary of processed datasets for each selection method
         """
-        # Generate features only once
+        logging.info(f"Starting fit_transform_all_modes with max_features={max_features}")
+        
         if self.transformed_df is None:
             self.transformed_df = self.base_transform.fit_transform(df, expand)
+            self.transformed_df.to_parquet("transformed_df.parquet")
 
+        results = {}
         X, y = split_features_target(self.transformed_df)
         
-        # Define all selectors
-        selectors = {
-            "nbest": SelectKBest(score_func=mutual_info_classif, k=max_features),
-            "FPR": SelectFpr(score_func=mutual_info_classif, alpha=1),
-            "FDR": SelectFdr(score_func=mutual_info_classif, alpha=1),
-            "FWER": SelectFwe(score_func=mutual_info_classif, alpha=1)
-        }
+        # Sample data for faster processing
+        logging.info(f"Sampling {sample_size} rows for feature selection...")
+        sample_idx = np.random.choice(len(X), size=min(sample_size, len(X)), replace=False)
+        X_sample = X.iloc[sample_idx]
+        y_sample = y.iloc[sample_idx]
         
-        # Fit all modes at once
-        results = {}
-        for mode, selector in selectors.items():
-            selector.fit(X, y)
-            scores = pd.Series(selector.scores_, index=selector.feature_names_in_)
-            self.columns[mode] = list(scores.nlargest(max_features, keep="all").index)
-            results[mode] = self.transformed_df[self.columns[mode]]
-            
+        for mode in ["nbest", "FPR", "FDR", "FWER", "model_based"]:
+            try:
+                logging.info(f"\nProcessing mode: {mode}")
+                
+                # Calculate MI scores once
+                mi_scores = mutual_info_classif(X_sample, y_sample)
+                scores = pd.Series(mi_scores, index=X_sample.columns)
+                
+                # Convert MI scores to p-values
+                p_values = 1 - stats.norm.cdf(stats.zscore(mi_scores))
+                
+                # Select features based on mode
+                if mode == "nbest":
+                    selected_features = scores.nlargest(max_features).index.tolist()
+                
+                elif mode == "model_based":
+                    selector = SelectFromModel(
+                        RandomForestClassifier(n_estimators=100, random_state=42),
+                        max_features=max_features
+                    )
+                    selector.fit(X_sample, y_sample)
+                    selected_features = X_sample.columns[selector.get_support()].tolist()
+                
+                else:
+                    # Apply different statistical tests
+                    if mode == "FPR":
+                        # Control false positive rate
+                        threshold = p_values < 0.6
+                    elif mode == "FDR":
+                        reject, _, _, _ = multipletests(p_values, method='fdr_bh', alpha=0.8)
+                        threshold = reject
+                    else:  # FWER
+                        reject, _, _, _ = multipletests(p_values, method='bonferroni', alpha=0.6)
+                        threshold = reject
+                    
+                    selected_features = X_sample.columns[threshold].tolist()
+                    
+                    # Fallback if too few features
+                    if len(selected_features) < 10:
+                        logging.info(f"Too few features selected ({len(selected_features)}), falling back to top {max_features}")
+                        selected_features = scores.nlargest(max_features).index.tolist()
+                
+                logging.info(f"Mode: {mode}")
+                logging.info(f"Features selected: {len(selected_features)}")
+                
+                # Evaluate feature set
+                X_selected = X_sample[selected_features]
+                cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+                clf = RandomForestClassifier(n_estimators=100, random_state=42, n_jobs=-1)
+                scores = cross_val_score(clf, X_selected, y_sample, cv=cv, scoring='roc_auc')
+                
+                mean_auc = np.mean(scores)
+                std_auc = np.std(scores)
+                
+                logging.info(f"Mean AUC-ROC: {mean_auc:.3f} ± {std_auc:.3f}")
+                
+                # Store results
+                self.columns[mode] = selected_features
+                results[mode] = self.transformed_df[selected_features + ['ACTIVE']]
+                
+                # Track best performance
+                if mean_auc > getattr(self, 'best_auc', 0):
+                    self.best_auc = mean_auc
+                    self.best_mode = mode
+                    
+            except Exception as e:
+                logging.error(f"Error in mode {mode}: {str(e)}")
+                continue
+        
         return results
 
     def transform(
@@ -493,53 +653,6 @@ def compute_score(selector: BaseEstimator):
     return importance
 
 
-class FromModelPreprocessing:
-    """
-    Extends BasePreprocessing with model-based feature selection:
-    - Uses any sklearn-compatible model's feature importance
-    - Selects top N most important features
-    - Can reuse molecular features from StatisticalPreprocessing
-    """
-    def __init__(self) -> None:
-        self.base_transform: BasePreprocessing = BasePreprocessing()
-        self.columns: List[str] = None
-        self.transformed_df: Optional[pd.DataFrame] = None
-
-    def fit_transform(
-        self,
-        df: pd.DataFrame,
-        model: BaseEstimator,
-        max_features: int = 10,
-        expand: bool = False,
-        precomputed_features: Optional[pd.DataFrame] = None
-    ) -> pd.DataFrame:
-        """
-        Parameters:
-            precomputed_features: Optional preprocessed features from StatisticalPreprocessing
-                                to avoid regenerating molecular features
-        """
-        # Reuse precomputed features if available
-        if precomputed_features is not None:
-            self.transformed_df = precomputed_features
-        else:
-            self.transformed_df = self.base_transform.fit_transform(df, expand)
-
-        X, y = split_features_target(self.transformed_df)
-
-        selector = SelectFromModel(model)
-        selector = selector.fit(X, y)
-        importance = compute_score(selector)
-
-        scores = pd.Series(data=importance, index=selector.feature_names_in_)
-        self.columns = list(scores.nlargest(max_features, keep="all").index)
-
-        return self.transformed_df[self.columns]
-
-    def transform(self, feature_df: pd.DataFrame, expand: bool = False) -> pd.DataFrame:
-        new_df = self.base_transform.transform(feature_df, expand)
-        return new_df[self.columns]
-
-
 def download_mol2vec_model(model_path: str = "models/model_300dim.pkl") -> None:
     """
     Downloads pretrained Mol2vec model if not present
@@ -558,72 +671,97 @@ def download_mol2vec_model(model_path: str = "models/model_300dim.pkl") -> None:
 
 def main():
     """
-    Process and save datasets for modeling
+    End-to-end preprocessing pipeline:
+    1. Downloads required Mol2Vec model
+    2. Loads training/test data
+    3. Applies feature engineering and selection
+    4. Evaluates feature selection methods
+    5. Saves processed datasets and selected features
+    
+    Handles caching of intermediate results for efficiency
     """
-    # Download Mol2vec model if needed
-    model_path = "models/model_300dim.pkl"
-    download_mol2vec_model(model_path)
-    
-    # Get data paths
-    current_dir = Path(__file__).parent
-    assignment_dir = current_dir.parent
-    
-    # Load raw data
-    train_df = pd.read_csv(assignment_dir / "training_smiles.csv")
-    test_df = pd.read_csv(assignment_dir / "test_smiles.csv")
-    
-    # Create output directory
-    output_dir = assignment_dir / "processed_data"
-    output_dir.mkdir(exist_ok=True)
-    
-    # 1. Statistical Feature Selection
-    print("\nRunning statistical feature selection...")
-    stat_preprocessor = StatisticalPreprocessing()
-    feature_sets = stat_preprocessor.fit_transform_all_modes(
-        train_df,
-        max_features=100,
-        expand=True
-    )
-    
-    # Save statistical feature sets
-    for mode, train_features in feature_sets.items():
-        # Save training data
-        train_features.to_parquet(output_dir / f"train_stat_{mode}.parquet")
+    try:
+        # Download Mol2vec model if needed
+        model_path = "models/model_300dim.pkl"
+        download_mol2vec_model(model_path)
         
-        # Process and save test data
-        test_features = stat_preprocessor.transform(test_df, mode, expand=True)
-        test_features.to_parquet(output_dir / f"test_stat_{mode}.parquet")
+        # Get data paths
+        current_dir = Path(__file__).parent
+        assignment_dir = current_dir.parent
+        output_dir = assignment_dir / "processed_data"
+        output_dir.mkdir(exist_ok=True)
         
-        print(f"\nStatistical Mode: {mode}")
-        print(f"Training shape: {train_features.shape}")
-        print(f"Test shape: {test_features.shape}")
-    
-    # 2. Model-based Feature Selection
-    print("\nRunning model-based feature selection...")
-    from sklearn.ensemble import RandomForestClassifier
-    
-    model_preprocessor = FromModelPreprocessing()
-    rf_model = RandomForestClassifier(n_estimators=100, random_state=42)
-    
-    # Reuse features from statistical preprocessing
-    train_features = model_preprocessor.fit_transform(
-        train_df,
-        model=rf_model,
-        max_features=100,
-        expand=True,
-        precomputed_features=stat_preprocessor.transformed_df
-    )
-    
-    # Transform test data
-    test_features = model_preprocessor.transform(test_df, expand=True)
-    
-    # Save model-based features
-    train_features.to_parquet(output_dir / "train_model_rf.parquet")
-    test_features.to_parquet(output_dir / "test_model_rf.parquet")
-    
-    print("\nModel-based Selection (RF):")
-    print(f"Training shape: {train_features.shape}")
-    print(f"Test shape: {test_features.shape}")
+        # Configure logging
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(levelname)s - %(message)s'
+        )
+        
+        # Load data
+        train_df = pd.read_csv(assignment_dir / "training_smiles.csv")
+        test_df = pd.read_csv(assignment_dir / "test_smiles.csv")
+        
+        # Process features and evaluate
+        logging.info("Running feature selection and evaluation...")
+        transformed_df = None
+        if os.path.exists("transformed_df.parquet"):
+            transformed_df = pd.read_parquet("transformed_df.parquet")
+            logging.info("Loaded pre-computed transformed data")
+        
+        # Process training data - first fit the base transform
+        stat_preprocessor = StatisticalPreprocessing(transformed_df=transformed_df)
+        if transformed_df is None:
+            # This will fit the base_transform
+            feature_sets = stat_preprocessor.fit_transform_all_modes(
+                train_df,
+                max_features=300,
+                expand=True
+            )
+        else:
+            # Need to ensure base_transform is fitted even when using cached transformed_df
+            stat_preprocessor.base_transform.fit_transform(train_df, expand=True)
+            feature_sets = stat_preprocessor.fit_transform_all_modes(
+                train_df,
+                max_features=300,
+                expand=False  # Already expanded in base_transform
+            )
+        
+        # Get best columns and save transformed training data
+        best_columns = stat_preprocessor.columns[stat_preprocessor.best_mode]
+        transformed_train = stat_preprocessor.transformed_df[best_columns + ['ACTIVE']]
+        transformed_train.to_parquet(output_dir / "processed_train.parquet")
+        
+        # Now transform test data using fitted base_transform
+        transformed_test = stat_preprocessor.base_transform.transform(
+            test_df, 
+            expand=True
+        )[best_columns]
+        
+        # Save processed test data
+        transformed_test.to_parquet(output_dir / "processed_test.parquet")
+        
+        # Save only the best performing feature set
+        best_mode = stat_preprocessor.best_mode
+        best_auc = stat_preprocessor.best_auc
+        best_columns = stat_preprocessor.columns[best_mode]
+        
+        logging.info(f"\nBest performing mode: {best_mode}")
+        logging.info(f"AUC-ROC: {best_auc:.3f}")
+        logging.info(f"Number of selected features: {len(best_columns)}")
+        
+        # Save selected columns to file
+        output_dir = Path(__file__).parent.parent / "processed_data"
+        output_dir.mkdir(exist_ok=True)
+        
+        columns_file = output_dir / "selected_columns.txt"
+        with open(columns_file, 'w') as f:
+            f.write('\n'.join(best_columns))
+            
+        logging.info(f"\nSaved selected columns to: {columns_file}")
+        
+    except Exception as e:
+        logging.error(f"Fatal error in main: {str(e)}")
+        raise
 
 if __name__ == "__main__":
     main()

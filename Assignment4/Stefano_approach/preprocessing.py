@@ -559,6 +559,10 @@ class StatisticalPreprocessing:
         X_sample = X.iloc[sample_idx]
         y_sample = y.iloc[sample_idx]
         
+        # Ensure index is not treated as a feature
+        X = X.reset_index(drop=True)  # Drop any existing index
+        X_sample = X_sample.reset_index(drop=True)
+
         for mode in ["nbest", "FPR", "FDR", "FWER", "model_based"]:
             try:
                 logging.info(f"\nProcessing mode: {mode}")
@@ -637,7 +641,8 @@ class StatisticalPreprocessing:
         expand: bool = False
     ) -> pd.DataFrame:
         new_df = self.base_transform.transform(feature_df, expand)
-        return new_df[self.columns[mode]]
+        columns = [col for col in self.columns[mode] if col != 'INDEX']  # Exclude INDEX
+        return new_df[columns]
 
 
 def compute_score(selector: BaseEstimator):
@@ -727,8 +732,10 @@ def main():
             )
         
         # Get best columns and save transformed training data
-        best_columns = stat_preprocessor.columns[stat_preprocessor.best_mode]
+        best_columns = [col for col in stat_preprocessor.columns[stat_preprocessor.best_mode] if col != 'INDEX']
         transformed_train = stat_preprocessor.transformed_df[best_columns + ['ACTIVE']]
+        if 'INDEX' in transformed_train.columns:
+            transformed_train = transformed_train.drop(columns=['INDEX'])
         transformed_train.to_parquet(output_dir / "processed_train.parquet")
         
         # Now transform test data using fitted base_transform
@@ -736,14 +743,14 @@ def main():
             test_df, 
             expand=True
         )[best_columns]
-        
-        # Save processed test data
+        if 'INDEX' in transformed_test.columns:
+            transformed_test = transformed_test.drop(columns=['INDEX'])
         transformed_test.to_parquet(output_dir / "processed_test.parquet")
         
         # Save only the best performing feature set
         best_mode = stat_preprocessor.best_mode
         best_auc = stat_preprocessor.best_auc
-        best_columns = stat_preprocessor.columns[best_mode]
+        best_columns = [col for col in stat_preprocessor.columns[best_mode] if col != 'INDEX']
         
         logging.info(f"\nBest performing mode: {best_mode}")
         logging.info(f"AUC-ROC: {best_auc:.3f}")

@@ -294,7 +294,9 @@ class BasePreprocessing:
 class StatisticalPreprocessing:
     def __init__(self) -> None:
         self.columns: List[str] = None
+        self.max_features: int = None
         self.base_transform: BasePreprocessing = BasePreprocessing()
+        self.fitted_data: pd.DataFrame = None
 
     def fit_transform(
         self,
@@ -308,7 +310,7 @@ class StatisticalPreprocessing:
         match mode:
             case "nbest":
                 top_features = SelectKBest(
-                    score_func=mutual_info_classif, k=max_features
+                    score_func=mutual_info_classif, k=new_df.shape[0] - 1
                 )
             case "FPR":
                 top_features = SelectFpr(score_func=mutual_info_classif, alpha=1)
@@ -321,13 +323,19 @@ class StatisticalPreprocessing:
         top_features = top_features.fit(X, y)
         scores = pd.Series(top_features.scores_, index=top_features.feature_names_in_)
 
-        self.columns = list(scores.nlargest(max_features, keep="all").index)
+        self.columns = list(scores.sort_values(ascending=False).index)
+        self.max_features = max_features
+        self.fitted_data = new_df
 
-        return new_df[self.columns]
+        return new_df[self.columns[:max_features] + ["ACTIVE"]]
 
     def transform(self, feature_df: pd.DataFrame, expand: bool = False) -> pd.DataFrame:
         new_df = self.base_transform.transform(feature_df, expand)
-        return new_df[self.columns]
+        return new_df[self.columns[: self.max_features]]
+
+    def change_fitted_data(self, max_features: int) -> pd.DataFrame:
+        self.max_features = max_features
+        return self.fitted_data[self.columns[:max_features] + ["ACTIVE"]]
 
 
 def compute_score(selector: BaseEstimator):
@@ -343,6 +351,8 @@ class FromModelPreprocessing:
     def __init__(self) -> None:
         self.base_transform: BasePreprocessing = BasePreprocessing()
         self.columns: List[str] = None
+        self.max_features: int = None
+        self.fitted_data: pd.DataFrame = None
 
     def fit_transform(
         self,
@@ -363,10 +373,16 @@ class FromModelPreprocessing:
 
         scores = pd.Series(data=importance, index=selector.feature_names_in_.squeeze())
 
-        self.columns = list(scores.nlargest(max_features, keep="all").index)
+        self.columns = list(scores.sort_values(ascending=False).index)
+        self.max_features = max_features
+        self.fitted_data = new_df
 
-        return new_df[self.columns]
+        return new_df[self.columns[:max_features] + ["ACTIVE"]]
 
     def transform(self, feature_df: pd.DataFrame, expand: bool = False) -> pd.DataFrame:
         new_df = self.base_transform.transform(feature_df, expand)
-        return new_df[self.columns]
+        return new_df[self.columns[: self.max_features]]
+
+    def change_fitted_data(self, max_features: int) -> pd.DataFrame:
+        self.max_features = max_features
+        return self.fitted_data[self.columns[:max_features] + ["ACTIVE"]]
